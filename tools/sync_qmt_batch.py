@@ -200,6 +200,14 @@ def updated_source(source):
     source = _replace_class_method(source, 'TxTradeBridge', '_order_stock', order_stock)
 
     sync_methods = (
+        '_order_stock_async',
+        '_async_order_record',
+        '_register_pending_async_order',
+        '_discard_pending_async_order',
+        '_prune_pending_async_orders_locked',
+        '_consume_pending_async_order',
+        '_handle_async_order_callback',
+        '_send_async_order_response',
         '_get_trading_dates',
         '_register_pending_sync_order',
         '_discard_pending_sync_order',
@@ -238,13 +246,31 @@ def updated_source(source):
         callback,
         1,
     ) if 'self._resolve_pending_sync_order_callback(data)' not in source else source
+    raw_callback = (
+        '        if event_name in ("trader:on_stock_order", "trader:on_stock_trade", "trader:on_order_error", '
+        '"trader:on_cancel_error", "trader:on_order_stock_async_response", '
+        '"trader:on_cancel_order_stock_async_response"):\n'
+    )
+    early_async_ack = (
+        '        if event_name == "trader:on_stock_order":\n'
+        '            self._handle_async_order_callback(data)\n'
+        + raw_callback
+    )
+    if early_async_ack not in source:
+        source = source.replace(raw_callback, early_async_ack, 1)
+    source = source.replace(
+        '            self._resolve_pending_sync_order_callback(data)\n'
+        '            self._handle_async_order_callback(data)\n',
+        '            self._resolve_pending_sync_order_callback(data)\n',
+        1,
+    )
     normal = (ROOT / 'cfquant/normal_bridge.py').read_text(encoding='utf-8')
     source = _replace_class_method(source, 'NormalQmtBridge', '_callback_account_type',
                                    _class_method(normal, 'NormalQmtBridge', '_callback_account_type'))
     for name in ('_drain_requests', '_drain_single_request'):
         source = _replace_class_method(source, 'NormalQmtBridge', name,
                                        _class_method(normal, 'NormalQmtBridge', name))
-    for name in ('_defer_sync_order_response', '_poll_sync_order_responses'):
+    for name in ('_defer_sync_order_response', '_poll_sync_order_responses', '_queued_request_expiry'):
         replacement = _class_method(normal, 'NormalQmtBridge', name)
         if 'def %s(' % name in source:
             source = _replace_class_method(source, 'NormalQmtBridge', name, replacement)

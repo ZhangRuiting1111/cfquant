@@ -8,6 +8,7 @@ import uuid
 
 PROTOCOL_VERSION = 1
 MESSAGE_PREFIX = "cfquant:"
+ORDER_RECONCILE_VIEW = "reconcile_v1"
 _pd = None
 _pd_loaded = False
 

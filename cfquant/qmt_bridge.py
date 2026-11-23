@@ -4,6 +4,7 @@ import queue
 import sys
 import threading
 import time
+import uuid
 
 from .config import get_config
 from .stock_connect import connect_account_type, validate_connect_order, validate_connect_market, query_connect_exchange_rate
@@ -884,18 +885,42 @@ class CfquantQmtBridge(object):
 
     def _order_stock_async(self, params, msg):
         seq = params.get("seq")
+        params = dict(params)
+        requested_ref = self._first_param(params, ("order_remark", "remark"))
+        if requested_ref is None or not str(requested_ref).strip():
+            params["order_remark"] = "CFQ" + uuid.uuid4().hex[:12]
+        else:
+            params["order_remark"] = str(requested_ref).strip()
+
+        # Make the seq/remark mapping visible before passorder can trigger
+        # an order callback on the QMT thread.
+        pending = self._async_order_record(params, msg, {})
+        self._register_pending_async_order(pending)
         try:
             result = self._order_stock(params, resolve_order_id=False)
-            request_result = result.get("request_result")
-            accepted = not self._is_failed_order_result(request_result)
-            if not accepted:
-                return {"seq": -1, "accepted": False, "request_result": request_result}
-
-            pending = self._async_order_record(params, msg, result)
-            self._register_pending_async_order(pending)
-            return {"seq": seq, "accepted": True, "request_result": request_result}
         except Exception:
-            raise
+            if self._discard_pending_async_order(pending):
+                raise
+            self._log(
+                "async order callback arrived before submit raised; treating callback as acceptance seq=%s"
+                % seq
+            )
+            return {"seq": seq, "accepted": True, "request_result": None}
+
+        request_result = result.get("request_result")
+        accepted = not self._is_failed_order_result(request_result)
+        if not accepted:
+            if not self._discard_pending_async_order(pending):
+                self._log(
+                    "async order callback arrived despite failed submit result; treating callback as acceptance seq=%s result=%s"
+                    % (seq, request_result)
+                )
+                return {"seq": seq, "accepted": True, "request_result": request_result}
+            return {"seq": -1, "accepted": False, "request_result": request_result}
+
+        pending["account_type"] = result.get("account_type") or pending["account_type"]
+        pending["previous_order_id"] = result.get("previous_order_id")
+        return {"seq": seq, "accepted": True, "request_result": request_result}
 
     def _async_order_record(self, params, msg, result):
         account = params.get("account") or {}
@@ -915,6 +940,17 @@ class CfquantQmtBridge(object):
         with self.pending_async_orders_lock:
             self._prune_pending_async_orders_locked()
             self.pending_async_orders.append(record)
+
+    def _discard_pending_async_order(self, pending):
+        with self.pending_async_orders_lock:
+            for index, item in enumerate(self.pending_async_orders):
+                # Sequence numbers are client-local; remove this exact request
+                # so one client's failed submit cannot discard another client's
+                # pending request with the same seq.
+                if item is pending:
+                    self.pending_async_orders.pop(index)
+                    return True
+        return False
 
     def _remember_order_request(self, account_id, stock_code, order_remark, strategy_name):
         key = (
@@ -962,33 +998,44 @@ class CfquantQmtBridge(object):
         if order_id is None:
             return None
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
-        strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
+        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "").strip()
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
         stock_code_base = stock_code.split(".", 1)[0]
+        if not order_remark or not account_id or not stock_code:
+            if not order_remark:
+                self._log(
+                    "async order ACK correlation skipped: callback has no raw order_remark "
+                    "account=%s code=%s order_id=%s"
+                    % (account_id or "-", stock_code or "-", order_id)
+                )
+            return None
         with self.pending_async_orders_lock:
             self._prune_pending_async_orders_locked()
+            matches = []
             for index, item in enumerate(self.pending_async_orders):
                 if account_id and str(item.get("account_id") or "").strip() != account_id:
                     continue
                 if item.get("previous_order_id") is not None and order_id == item.get("previous_order_id"):
                     continue
                 expected_remark = str(item.get("order_remark") or "")
-                expected_strategy = str(item.get("strategy_name") or "")
-                if order_remark and expected_remark and order_remark != expected_remark:
-                    continue
-                if not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
+                if not expected_remark or order_remark != expected_remark:
                     continue
                 expected_code = str(item.get("stock_code") or "").upper()
                 if (
                     expected_code
-                    and stock_code
                     and expected_code != stock_code
                     and expected_code.split(".", 1)[0] != stock_code_base
                 ):
                     continue
-                return self.pending_async_orders.pop(index), order_id
-        return None
+                matches.append(index)
+            if len(matches) != 1:
+                if len(matches) > 1:
+                    self._log(
+                        "async order ACK correlation skipped: client reference is ambiguous "
+                        "order_remark=%s candidates=%s" % (order_remark, len(matches))
+                    )
+                return None
+            return self.pending_async_orders.pop(matches[0]), order_id
 
     def _handle_async_order_callback(self, order):
         matched = self._consume_pending_async_order(order)

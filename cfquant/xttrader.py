@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+import uuid
 import atexit
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -11,8 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .client import create_rpc_client
 from .config import get_config
 from .channels import channels_for_bridge, normalize_bridge_id
-from .protocol import new_id
-from .order_meta import positive_order_id
+from .protocol import ORDER_RECONCILE_VIEW, new_id
 from . import xtconstant
 from .stock_connect import connect_account_type, validate_connect_order
 from .xttype import (
@@ -519,6 +519,11 @@ class XtQuantTrader(object):
 
     def order_stock_async(self, account, stock_code, order_type, order_volume, price_type, price, strategy_name="", order_remark=""):
         seq = next(self._seq)
+        order_remark = str(order_remark or "").strip()
+        if not order_remark:
+            # A strategy name is shared by simultaneous orders; give each
+            # request its own callback-correlation token.
+            order_remark = "CFQ" + uuid.uuid4().hex[:12]
         request = {
             "account": _account_payload(account),
             "stock_code": validate_connect_order({"stock_code": stock_code}, _account_payload(account).get("account_type")),
@@ -614,6 +619,42 @@ class XtQuantTrader(object):
             "account": _account_payload(account),
             "cancelable_only": cancelable_only,
         })
+        return self._stock_order_objects(account, result, cancelable_only)
+
+    def query_order_reconcile_snapshot(self, account, trace_id=None):
+        """Read a compact order snapshot containing live and terminal orders."""
+        trace_id = trace_id or new_id("order_snapshot")
+        started = time.perf_counter()
+        logger = logging.getLogger(__name__)
+        try:
+            result = self._trade_request("xttrader.query_stock_orders", {
+                "account": _account_payload(account),
+                "cancelable_only": False,
+                "snapshot_view": ORDER_RECONCILE_VIEW,
+                "snapshot_trace_id": trace_id,
+            })
+            if isinstance(result, list):
+                view = "legacy"
+                orders = self._stock_order_objects(account, result, False)
+            else:
+                if not isinstance(result, dict) or result.get("snapshot_view") != ORDER_RECONCILE_VIEW:
+                    raise ValueError("invalid QMT reconciliation snapshot version")
+                view = ORDER_RECONCILE_VIEW
+                orders = result.get("orders")
+                if not isinstance(orders, list) or any(
+                    not isinstance(row, dict) or "m_strOrderSysID" not in row for row in orders
+                ):
+                    raise ValueError("invalid QMT reconciliation snapshot rows")
+        except Exception:
+            logger.warning("cfquant order_snapshot trace=%r client_ms=%.2f failed",
+                           trace_id, (time.perf_counter() - started) * 1000)
+            raise
+        logger.info("cfquant order_snapshot trace=%r view=%s rows=%s client_ms=%.2f",
+                    trace_id, view, len(orders), (time.perf_counter() - started) * 1000)
+        return orders
+
+    @staticmethod
+    def _stock_order_objects(account, result, cancelable_only):
         order_type = XtCreditOrder if _account_type_value(_account_payload(account).get("account_type")) == xtconstant.CREDIT_ACCOUNT else XtOrder
         orders = to_objects(result, order_type)
         if cancelable_only:
@@ -891,20 +932,12 @@ class XtQuantTrader(object):
                 return
             if name == "on_cancel_order_stock_async_response" and not self._accept_async_cancel_response(data):
                 return
-            async_response = None
-            if name == "on_stock_order":
-                async_response = self._async_order_response_from_order(data)
             func = getattr(self.callback, name, None)
             if callable(func):
                 if name in ("on_connected", "on_disconnected"):
                     func()
                 else:
                     func(data)
-            if async_response is not None:
-                response_func = getattr(self.callback, "on_order_stock_async_response", None)
-                if callable(response_func):
-                    response_func(async_response)
-
         return handler
 
     def _accept_order_update(self, order):
@@ -975,10 +1008,20 @@ class XtQuantTrader(object):
     def _accept_async_order_response(self, response):
         seq = getattr(response, "seq", None)
         if seq is None:
-            return True
+            return False
         with self._pending_async_orders_lock:
             self._prune_async_order_state_locked()
             if seq in self._completed_async_order_seqs:
+                return False
+            pending = next(
+                (item for item in self._pending_async_orders if item.get("seq") == seq),
+                None,
+            )
+            if pending is None:
+                return False
+            expected_remark = str(pending.get("order_remark") or "").strip()
+            response_remark = str(getattr(response, "order_remark", "") or "").strip()
+            if expected_remark and response_remark != expected_remark:
                 return False
             self._pending_async_orders[:] = [
                 item for item in self._pending_async_orders if item.get("seq") != seq
@@ -987,46 +1030,10 @@ class XtQuantTrader(object):
         return True
 
     def _async_order_response_from_order(self, order):
-        # Cross-QMT notifications can carry a market-prefixed broker sysid.
-        # It must not complete the seq and suppress the real async response.
-        order_id = None
-        for name in ("order_id", "m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID"):
-            order_id = positive_order_id(getattr(order, name, None))
-            if order_id is not None:
-                break
-        if order_id is None:
-            return None
-        account_id = _event_account_id(order)
-        stock_code = str(getattr(order, "stock_code", "") or "").strip().upper()
-        stock_code_base = stock_code.split(".", 1)[0]
-        order_remark = str(getattr(order, "order_remark", "") or "")
-        with self._pending_async_orders_lock:
-            self._prune_async_order_state_locked()
-            matched = None
-            for index, item in enumerate(self._pending_async_orders):
-                if account_id and item.get("account_id") and item.get("account_id") != account_id:
-                    continue
-                expected_code = str(item.get("stock_code") or "").upper()
-                if expected_code and stock_code and expected_code.split(".", 1)[0] != stock_code_base:
-                    continue
-                expected_remark = str(item.get("order_remark") or "")
-                if order_remark and expected_remark and order_remark != expected_remark:
-                    continue
-                matched = self._pending_async_orders.pop(index)
-                break
-            if matched is None:
-                return None
-            self._completed_async_order_seqs[matched.get("seq")] = time.time()
-        order.order_remark = matched.get("order_remark", "")
-        order.strategy_name = matched.get("strategy_name", "")
-        return XtOrderResponse.from_any({
-            "account_type": matched.get("account_type"),
-            "account_id": matched.get("account_id", ""),
-            "order_id": order_id,
-            "strategy_name": matched.get("strategy_name", ""),
-            "order_remark": matched.get("order_remark", ""),
-            "seq": matched.get("seq"),
-        })
+        # An order-state callback has no request seq. Inferring an async ACK
+        # from account/code/FIFO can bind a cancel or older order to a new
+        # request. The bridge's explicit, seq-bearing ACK is authoritative.
+        return None
 
     def _register_pending_async_cancel(self, seq):
         with self._pending_async_cancels_lock:

@@ -397,6 +397,105 @@ def test_tx_trade_bridge_async_positive_request_result_waits_for_real_order_call
     assert events[0][2]["order_id"] == 700026
 
 
+def test_tx_trade_bridge_keeps_inline_order_callback_that_arrives_during_submit():
+    events = []
+    bridge = None
+
+    def passorder(*args):
+        assert bridge.pending_async_orders
+        assert bridge._handle_async_order_callback({
+            "m_strAccountID": "A123",
+            "m_strInstrumentID": "000001",
+            "m_strExchangeID": "SZ",
+            "m_nRef": 700027,
+            "m_strRemark": args[9],
+        })
+        return 0
+
+    bridge = TxTradeBridge(
+        DummyContext(),
+        show=False,
+        globals_dict={"passorder": passorder},
+    )
+    bridge._send_trader_event = lambda client_id, name, data: events.append((client_id, name, data))
+
+    result = bridge._order_stock_async(
+        _base_order_params(strategy_name="hxy", order_remark="inline-ref", seq=27),
+        {"id": "request-inline", "client_id": "client-inline"},
+    )
+
+    assert result == {"seq": 27, "accepted": True, "request_result": 0}
+    assert events == [("client-inline", "on_order_stock_async_response", {
+        "account_type": "STOCK",
+        "account_id": "A123",
+        "order_id": 700027,
+        "strategy_name": "hxy",
+        "order_remark": "inline-ref",
+        "seq": 27,
+    })]
+    assert bridge.pending_async_orders == []
+
+
+def test_qmt_bridge_keeps_inline_order_callback_that_arrives_during_submit():
+    events = []
+    bridge = None
+
+    def passorder(*args):
+        assert bridge.pending_async_orders
+        assert bridge._handle_async_order_callback({
+            "account_id": "A123",
+            "stock_code": "000001.SZ",
+            "order_id": 800027,
+            "order_remark": args[9],
+        })
+        return 0
+
+    bridge = CfquantQmtBridge(
+        DummyContext(),
+        show=False,
+        globals_dict={"passorder": passorder},
+    )
+    bridge._send_trader_event = lambda client_id, name, data: events.append((client_id, name, data))
+
+    result = bridge._order_stock_async(
+        _base_order_params(strategy_name="hxy", order_remark="qmt-inline-ref", seq=28),
+        {"id": "request-qmt-inline", "client_id": "client-qmt-inline"},
+    )
+
+    assert result == {"seq": 28, "accepted": True, "request_result": 0}
+    assert events == [("client-qmt-inline", "on_order_stock_async_response", {
+        "account_type": "STOCK",
+        "account_id": "A123",
+        "order_id": 800027,
+        "strategy_name": "hxy",
+        "order_remark": "qmt-inline-ref",
+        "seq": 28,
+    })]
+    assert bridge.pending_async_orders == []
+
+
+def test_qmt_bridge_failed_submit_only_discards_its_own_client_seq():
+    bridge = CfquantQmtBridge(
+        DummyContext(),
+        show=False,
+        globals_dict={"passorder": lambda *args: -1},
+    )
+    other_client_pending = bridge._async_order_record(
+        _base_order_params(seq=28, order_remark="other-qmt-client-ref"),
+        {"id": "other-request", "client_id": "other-qmt-client"},
+        {},
+    )
+    bridge._register_pending_async_order(other_client_pending)
+
+    result = bridge._order_stock_async(
+        _base_order_params(seq=28, order_remark="failed-qmt-client-ref"),
+        {"id": "failed-request", "client_id": "failed-qmt-client"},
+    )
+
+    assert result == {"seq": -1, "accepted": False, "request_result": -1}
+    assert bridge.pending_async_orders == [other_client_pending]
+
+
 def test_tx_trade_bridge_async_explicit_failure_is_not_registered():
     bridge = TxTradeBridge(
         DummyContext(),
@@ -413,7 +512,29 @@ def test_tx_trade_bridge_async_explicit_failure_is_not_registered():
     assert bridge.pending_async_orders == []
 
 
-def test_normal_bridge_turns_real_order_callback_into_xtorderresponse():
+def test_tx_trade_bridge_failed_submit_only_discards_its_own_client_seq():
+    bridge = TxTradeBridge(
+        DummyContext(),
+        show=False,
+        globals_dict={"passorder": lambda *args: -1},
+    )
+    other_client_pending = bridge._async_order_record(
+        _base_order_params(seq=23, order_remark="other-client-ref"),
+        {"id": "other-request", "client_id": "other-client"},
+        {},
+    )
+    bridge._register_pending_async_order(other_client_pending)
+
+    result = bridge._order_stock_async(
+        _base_order_params(seq=23, order_remark="failed-client-ref"),
+        {"id": "request-3", "client_id": "client-3"},
+    )
+
+    assert result == {"seq": -1, "accepted": False, "request_result": -1}
+    assert bridge.pending_async_orders == [other_client_pending]
+
+
+def test_normal_bridge_requires_raw_unique_reference_for_async_ack():
     events = []
     bridge = NormalQmtBridge(
         DummyContext(),
@@ -438,15 +559,34 @@ def test_normal_bridge_turns_real_order_callback_into_xtorderresponse():
         "m_nRef": 700002,
         "m_strOrderRef": "700002",
         "m_strOrderSysID": "SYS-2",
+        "m_nOrderStatus": xtconstant.ORDER_CANCELED,
         "m_strRemark": "",
         "m_strStrategyName": "",
     })
 
     response_events = [item for item in events if item[1] == "on_order_stock_async_response"]
+    assert response_events == []
+    assert len(bridge.pending_async_orders) == 1
+
+    # The state callback above may be enriched for reporting, but that inferred
+    # value must not be used to claim the async request. Only the raw exact ref
+    # can complete it.
+    bridge.publish_callback_event("trader:on_stock_order", {
+        "m_strAccountID": "A123",
+        "m_nAccountType": 2,
+        "m_strInstrumentID": "000001",
+        "m_strExchangeID": "SZ",
+        "m_nRef": 700003,
+        "m_strOrderRef": "700003",
+        "m_strOrderSysID": "SYS-3",
+        "m_strRemark": "remark",
+        "m_strStrategyName": "hxy",
+    })
+    response_events = [item for item in events if item[1] == "on_order_stock_async_response"]
     assert response_events == [("client-4", "on_order_stock_async_response", {
         "account_type": "STOCK",
         "account_id": "A123",
-        "order_id": 700002,
+        "order_id": 700003,
         "strategy_name": "hxy",
         "order_remark": "remark",
         "seq": 24,

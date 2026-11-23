@@ -11,7 +11,7 @@ import time
 
 from . import order_meta
 from .level2 import L2_THOUSAND_SUBSCRIPTIONS, quote_callback_data, quote_plain, require_l2_callable, thousand_price
-from .protocol import loads_message, pack_event, pack_response
+from .protocol import ORDER_RECONCILE_VIEW, loads_message, pack_event, pack_response
 from .tx_trade_bridge import TxTradeBridge, relay_sync_order_callback
 
 
@@ -26,6 +26,16 @@ COALESCED_QUERY_ACTIONS = set([
     "xttrader.query_credit_assure",
     "xttrader.query_stk_compacts",
 ])
+
+_RECONCILE_ORDER_FIELDS = (
+    "account_id", "stock_code", "order_type", "order_volume", "price", "traded_volume",
+    "order_status", "order_remark", "m_strOrderSysID", "order_sysid", "order_id",
+    "status_msg", "m_strCancelInfo", "strategy_name",
+)
+
+
+def _is_order_reconcile_query(action, params):
+    return action == "xttrader.query_stock_orders" and params.get("snapshot_view") == ORDER_RECONCILE_VIEW
 
 
 class NormalQmtBridge(TxTradeBridge):
@@ -441,6 +451,18 @@ class NormalQmtBridge(TxTradeBridge):
         self._log("normal bridge worker thread started in init context")
 
     def _dispatch(self, action, params, msg):
+        if _is_order_reconcile_query(action, params):
+            if self._truthy_param(params.get("cancelable_only")):
+                raise ValueError("reconciliation requires live and terminal orders")
+            timing = {}
+            rows = self._query_trade_detail(params, "order", timing=timing)
+            if any(not isinstance(row, dict) or "format_error" in row for row in rows):
+                raise ValueError("QMT returned an incomplete reconciliation snapshot")
+            return {
+                "snapshot_view": ORDER_RECONCILE_VIEW,
+                "orders": [{key: row[key] for key in _RECONCILE_ORDER_FIELDS if key in row} for row in rows],
+                "timing": timing,
+            }
         if action in ("xtdata.subscribe_l2thousand", "xtdata.subscribe_l2thousand_queue"):
             return self._subscribe_native_quote(dict(msg, params=params), "thousand", action.split(".", 1)[1])
         if action in ("xtdata.subscribe_whole_quote", "xtdata.subscribe_quote", "xtdata.unsubscribe_quote"):
@@ -581,6 +603,10 @@ class NormalQmtBridge(TxTradeBridge):
             return False
         received_at = time.time()
         action = msg.get("action")
+        params = msg.get("params") or {}
+        if _is_order_reconcile_query(action, params):
+            self._log("cfquant order_snapshot received trace=%r id=%s"
+                      % (str(params.get("snapshot_trace_id", ""))[:80], msg.get("id")))
         with self.coalesce_lock:
             current = self.coalesced_requests.get(coalesce_key)
             if current is not None:
@@ -618,6 +644,9 @@ class NormalQmtBridge(TxTradeBridge):
         if action not in COALESCED_QUERY_ACTIONS:
             return None
         params = msg.get("params") or {}
+        if _is_order_reconcile_query(action, params):
+            params = dict(params)
+            params.pop("snapshot_trace_id", None)
         try:
             params_key = json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
         except Exception:
@@ -690,6 +719,15 @@ class NormalQmtBridge(TxTradeBridge):
         return msg, received_at, None
 
     def _drain_single_request(self, source, msg, received_at):
+        expiry = self._queued_request_expiry(msg, received_at)
+        if expiry is not None:
+            self._log(
+                "normal bridge dropped expired request before QMT dispatch "
+                "source=%s action=%s id=%s error=%s"
+                % (source, msg.get("action"), msg.get("id"), expiry)
+            )
+            self._send_error(msg, expiry)
+            return
         try:
             if self.dispatch_on_qmt_thread and msg.get("action") == "xttrader.order_stock":
                 self._defer_sync_order_response(msg)
@@ -706,6 +744,19 @@ class NormalQmtBridge(TxTradeBridge):
                 % (source, msg.get("action"), msg.get("id"), e)
             )
             self._send_error(msg, e)
+
+    def _queued_request_expiry(self, msg, received_at):
+        timeout = msg.get("timeout")
+        if timeout is None:
+            return None
+        timeout = float(timeout)
+        age = max(0.0, time.time() - received_at)
+        if timeout <= 0 or age < timeout:
+            return None
+        return TimeoutError(
+            "cfquant request expired before QMT dispatch: action=%s age=%.2fs timeout=%.2fs"
+            % (msg.get("action"), age, timeout)
+        )
 
     def _defer_sync_order_response(self, msg):
         # Keep the RPC open, but return control to QMT so it can process the
@@ -774,14 +825,46 @@ class NormalQmtBridge(TxTradeBridge):
                 self._send_error(record["response_msg"], error)
 
     def _drain_coalesced_request(self, source, msg, received_at, coalesce_key):
+        with self.coalesce_lock:
+            entry = self.coalesced_requests.get(coalesce_key)
+            queued_waiters = list(entry.get("waiters", [])) if entry else [(msg, received_at)]
+            active_waiters = []
+            expired_waiters = []
+            for waiter_msg, waiter_received_at in queued_waiters:
+                expiry = self._queued_request_expiry(waiter_msg, waiter_received_at)
+                if expiry is None:
+                    active_waiters.append((waiter_msg, waiter_received_at))
+                else:
+                    expired_waiters.append(waiter_msg)
+            if not active_waiters:
+                self.coalesced_requests.pop(coalesce_key, None)
+
+        for waiter_msg in expired_waiters:
+            self._log(
+                "normal bridge dropped expired coalesced request before QMT dispatch "
+                "source=%s action=%s id=%s"
+                % (source, waiter_msg.get("action"), waiter_msg.get("id"))
+            )
+        if not active_waiters:
+            return
+
         try:
-            result = self._dispatch(msg.get("action"), msg.get("params") or {}, msg)
+            dispatch_msg, _ = active_waiters[0]
+            dispatched_at = time.time()
+            result = self._dispatch(
+                dispatch_msg.get("action"), dispatch_msg.get("params") or {}, dispatch_msg
+            )
             with self.coalesce_lock:
                 entry = self.coalesced_requests.pop(coalesce_key, None)
                 self.coalesce_dispatch_count += 1
             waiters = entry.get("waiters", []) if entry else [(msg, received_at)]
-            for waiter_msg, _ in waiters:
-                self._send_response(waiter_msg, result)
+            for waiter_msg, waiter_received_at in waiters:
+                if self._queued_request_expiry(waiter_msg, waiter_received_at) is None:
+                    if isinstance(result, dict) and result.get("snapshot_view") == ORDER_RECONCILE_VIEW:
+                        queue_ms = max(0, (dispatched_at - waiter_received_at) * 1000)
+                        self._send_response(waiter_msg, result, snapshot_queue_ms=queue_ms)
+                    else:
+                        self._send_response(waiter_msg, result)
             self._log(
                 "normal bridge worker coalesced_response source=%s action=%s id=%s waiters=%s total_ms=%.2f"
                 % (source, msg.get("action"), msg.get("id"), len(waiters), (time.time() - received_at) * 1000)
@@ -795,8 +878,9 @@ class NormalQmtBridge(TxTradeBridge):
                 "normal bridge worker coalesced_error source=%s action=%s id=%s waiters=%s error=%s"
                 % (source, msg.get("action"), msg.get("id"), len(waiters), e)
             )
-            for waiter_msg, _ in waiters:
-                self._send_error(waiter_msg, e)
+            for waiter_msg, waiter_received_at in waiters:
+                if self._queued_request_expiry(waiter_msg, waiter_received_at) is None:
+                    self._send_error(waiter_msg, e)
 
     def _on_whole_quote(self, data):
         self._release_worker("whole_quote")
@@ -829,12 +913,24 @@ class NormalQmtBridge(TxTradeBridge):
         except Exception as e:
             self._log("normal bridge timer schedule failed: %s" % e)
 
-    def _send_response(self, msg, result):
+    def _send_response(self, msg, result, snapshot_queue_ms=None):
         client_id = msg.get("client_id") or msg.get("reply_channel")
         if not client_id:
             return
+        pack_started = time.perf_counter()
         response = pack_response(msg.get("id"), ok=True, result=result)
+        packed_at = time.perf_counter()
         self.tx.push("response", response, client_id)
+        if snapshot_queue_ms is not None:
+            timing = result["timing"]
+            trace = str((msg.get("params") or {}).get("snapshot_trace_id", ""))[:80]
+            self._log(
+                "cfquant order_snapshot trace=%r id=%s rows=%s queue_ms=%.2f qmt_ms=%.2f "
+                "normalize_ms=%.2f pack_ms=%.2f send_ms=%.2f"
+                % (trace, msg.get("id"), len(result["orders"]), snapshot_queue_ms, timing["qmt_ms"],
+                   timing["normalize_ms"], (packed_at - pack_started) * 1000,
+                   (time.perf_counter() - packed_at) * 1000)
+            )
 
     def _send_error(self, msg, error):
         client_id = msg.get("client_id") or msg.get("reply_channel")
@@ -869,6 +965,10 @@ class NormalQmtBridge(TxTradeBridge):
             data.setdefault("account_id", account_id)
         if account_type:
             data.setdefault("account_type", account_type)
+        if event_name == "trader:on_stock_order":
+            # Correlate the ACK from the raw QMT remark before order-meta
+            # enrichment can attach inferred fields to an unrelated update.
+            self._handle_async_order_callback(data)
         if event_name == "trader:on_order_error":
             self._enrich_qmt_order_error_fields(data)
             if not force_order_error:
@@ -890,7 +990,6 @@ class NormalQmtBridge(TxTradeBridge):
             # resolver then reads the canonical id from the ORDER query.
             self._resolve_pending_sync_order_callback(data)
             relay_sync_order_callback(self.context, data)
-            self._handle_async_order_callback(data)
         payload = {
             "type": "event",
             "event": event_name,
@@ -951,20 +1050,26 @@ class NormalQmtBridge(TxTradeBridge):
         code = str(order.get("stock_code") or "").upper().split(".", 1)[0]
         strategy = str(order.get("strategy_name") or "")
         remark = str(order.get("order_remark") or "")
+        # QMT may deliver orderError_callback asynchronously after a cancel
+        # race. Account/symbol/strategy are shared by many orders, so they do
+        # not identify the order that produced the error. Only join it to an
+        # order callback when the per-order remark is present on both sides.
+        if not remark:
+            return None
         with self.pending_order_errors_lock:
             for index, item in enumerate(self.pending_order_errors):
                 error = item.get("data") or {}
                 error_account = str(error.get("account_id") or "").strip()
                 error_code = str(error.get("stock_code") or "").upper().split(".", 1)[0]
+                error_remark = str(error.get("order_remark") or error.get("m_strRemark") or "")
+                if not error_remark or error_remark != remark:
+                    continue
                 if account and error_account and account != error_account:
                     continue
                 if code and error_code and code != error_code:
                     continue
                 error_strategy = str(error.get("strategy_name") or error.get("strategyName") or "")
                 if error_strategy and strategy and error_strategy != strategy and not strategy.startswith(error_strategy + "&&&"):
-                    continue
-                error_remark = str(error.get("order_remark") or error.get("m_strRemark") or "")
-                if error_remark and remark and error_remark != remark:
                     continue
                 self.pending_order_errors.pop(index)
                 return error

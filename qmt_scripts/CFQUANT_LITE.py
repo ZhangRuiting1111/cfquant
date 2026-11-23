@@ -503,7 +503,7 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
         time.sleep(min(0.05, remaining))
 # END GENERATED CFTRADER BATCH
 
-CORE_VERSION = "0.2.42"
+CORE_VERSION = "0.2.44"
 LITE_ENTRY_VERSION = "lite_20260828_01"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
@@ -2721,6 +2721,18 @@ class TxTradeBridge(object):
         return bool(previous_key and previous_key in self._order_reference_values(order))
 
 
+    def _discard_pending_async_order(self, pending):
+        with self.pending_async_orders_lock:
+            for index, item in enumerate(self.pending_async_orders):
+                # Sequence numbers are client-local; remove this exact request
+                # so one client's failed submit cannot discard another client's
+                # pending request with the same seq.
+                if item is pending:
+                    self.pending_async_orders.pop(index)
+                    return True
+        return False
+
+
     def _get_last_order_id(self, account_id, account_type, strategy_name=""):
         func = self._get_callable("get_last_order_id")
         if not func:
@@ -2862,14 +2874,43 @@ class TxTradeBridge(object):
 
     def _order_stock_async(self, params, msg):
         seq = params.get("seq")
-        result = self._order_stock(params, msg, resolve_order_id=False, trust_request_order_id=False)
+        params = dict(params)
+        requested_ref = self._first_param(params, ("order_remark", "remark"))
+        if requested_ref is None or not str(requested_ref).strip():
+            # Never use the shared strategy name as an async correlation key.
+            params["order_remark"] = "CFQ" + uuid.uuid4().hex[:12]
+        else:
+            params["order_remark"] = str(requested_ref).strip()
+
+        # Register before calling QMT: an order-state callback can arrive
+        # synchronously while passorder is still returning. If we register
+        # afterwards, its only seq-bearing ACK is silently lost.
+        pending = self._async_order_record(params, msg, {})
+        self._register_pending_async_order(pending)
+        try:
+            result = self._order_stock(params, msg, resolve_order_id=False, trust_request_order_id=False)
+        except Exception:
+            if self._discard_pending_async_order(pending):
+                raise
+            self._log(
+                "async order callback arrived before submit raised; treating callback as acceptance seq=%s"
+                % seq
+            )
+            return {"seq": seq, "accepted": True, "request_result": None}
+
         request_result = result.get("request_result")
         accepted = not self._is_failed_order_result(request_result)
         if not accepted:
+            if not self._discard_pending_async_order(pending):
+                self._log(
+                    "async order callback arrived despite failed submit result; treating callback as acceptance seq=%s result=%s"
+                    % (seq, request_result)
+                )
+                return {"seq": seq, "accepted": True, "request_result": request_result}
             return {"seq": -1, "accepted": False, "request_result": request_result}
 
-        pending = self._async_order_record(params, msg, result)
-        self._register_pending_async_order(pending)
+        pending["account_type"] = result.get("account_type") or pending["account_type"]
+        pending["previous_order_id"] = result.get("previous_order_id")
         return {"seq": seq, "accepted": True, "request_result": request_result}
 
     def _async_order_record(self, params, msg, result):
@@ -3001,33 +3042,47 @@ class TxTradeBridge(object):
         if order_id is None:
             return None
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
-        strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
+        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "").strip()
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
         stock_code_base = stock_code.split(".", 1)[0]
+        # A QMT order-state callback has no request seq. Require the raw,
+        # per-order client reference; account/code/strategy/FIFO are not
+        # unique and can bind a cancel or an older quote to a new hedge.
+        if not order_remark or not account_id or not stock_code:
+            if not order_remark:
+                self._log(
+                    "async order ACK correlation skipped: callback has no raw order_remark "
+                    "account=%s code=%s order_id=%s"
+                    % (account_id or "-", stock_code or "-", order_id)
+                )
+            return None
         with self.pending_async_orders_lock:
             self._prune_pending_async_orders_locked()
+            matches = []
             for index, item in enumerate(self.pending_async_orders):
                 if account_id and str(item.get("account_id") or "").strip() != account_id:
                     continue
                 if item.get("previous_order_id") is not None and order_id == item.get("previous_order_id"):
                     continue
                 expected_remark = str(item.get("order_remark") or "")
-                expected_strategy = str(item.get("strategy_name") or "")
-                if order_remark and expected_remark and order_remark != expected_remark:
-                    continue
-                if not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
+                if not expected_remark or order_remark != expected_remark:
                     continue
                 expected_code = str(item.get("stock_code") or "").upper()
                 if (
                     expected_code
-                    and stock_code
                     and expected_code != stock_code
                     and expected_code.split(".", 1)[0] != stock_code_base
                 ):
                     continue
-                return self.pending_async_orders.pop(index), order_id
-        return None
+                matches.append(index)
+            if len(matches) != 1:
+                if len(matches) > 1:
+                    self._log(
+                        "async order ACK correlation skipped: client reference is ambiguous "
+                        "order_remark=%s candidates=%s" % (order_remark, len(matches))
+                    )
+                return None
+            return self.pending_async_orders.pop(matches[0]), order_id
 
     def _handle_async_order_callback(self, order):
         matched = self._consume_pending_async_order(order)
@@ -4932,7 +4987,29 @@ class NormalQmtBridge(TxTradeBridge):
                 self._discard_pending_sync_order(record)
                 self._send_error(record["response_msg"], error)
 
+    def _queued_request_expiry(self, msg, received_at):
+        timeout = msg.get("timeout")
+        if timeout is None:
+            return None
+        timeout = float(timeout)
+        age = max(0.0, time.time() - received_at)
+        if timeout <= 0 or age < timeout:
+            return None
+        return TimeoutError(
+            "cfquant request expired before QMT dispatch: action=%s age=%.2fs timeout=%.2fs"
+            % (msg.get("action"), age, timeout)
+        )
+
     def _drain_single_request(self, source, msg, received_at):
+        expiry = self._queued_request_expiry(msg, received_at)
+        if expiry is not None:
+            self._log(
+                "normal bridge dropped expired request before QMT dispatch "
+                "source=%s action=%s id=%s error=%s"
+                % (source, msg.get("action"), msg.get("id"), expiry)
+            )
+            self._send_error(msg, expiry)
+            return
         try:
             if getattr(self, "dispatch_on_qmt_thread", False) and msg.get("action") == "xttrader.order_stock":
                 self._defer_sync_order_response(msg)
@@ -5037,11 +5114,12 @@ class NormalQmtBridge(TxTradeBridge):
         account_type = self._callback_account_type(obj, data)
         if account_type:
             data.setdefault("account_type", account_type)
+        if event_name == "trader:on_stock_order":
+            self._handle_async_order_callback(data)
         if event_name in ("trader:on_stock_order", "trader:on_stock_trade", "trader:on_order_error", "trader:on_cancel_error", "trader:on_order_stock_async_response", "trader:on_cancel_order_stock_async_response"):
             self._enrich_order_request_fields(data)
         if event_name == "trader:on_stock_order":
             self._resolve_pending_sync_order_callback(data)
-            self._handle_async_order_callback(data)
         payload = {
             "type": "event",
             "event": event_name,

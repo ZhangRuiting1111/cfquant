@@ -104,6 +104,25 @@ def test_dispatch_uses_explicit_params(bridge):
     assert bridge.context.subscribed == [["BJ"]]
 
 
+def test_dispatch_rejects_expired_request_and_runs_fresh_request(bridge, monkeypatch):
+    dispatched = []
+    monkeypatch.setattr(bridge, "_dispatch", lambda action, params, msg: dispatched.append(msg["id"]))
+    received_at = time.time()
+    for request_id, queued_at in (("expired", received_at - 120), ("fresh", received_at)):
+        message = loads_message(pack_request(
+            "xttrader.order_stock_async", client_id="client-a", request_id=request_id, timeout=60,
+        ))
+        bridge._drain_single_request("test", message, queued_at)
+
+    assert dispatched == ["fresh"]
+    expired, fresh = [response for _, response, _ in bridge.tx.messages]
+    assert expired["id"] == "expired"
+    assert expired["ok"] is False
+    assert "expired before QMT dispatch" in expired["error"]["message"]
+    assert fresh["id"] == "fresh"
+    assert fresh["ok"] is True
+
+
 def test_subscriptions_and_callbacks_are_independent(bridge):
     bridge._subscribe_internal_whole_quote()
     first = rpc(bridge, "xtdata.subscribe_whole_quote", {"code_list": ["BJ"]})

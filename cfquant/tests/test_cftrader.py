@@ -41,7 +41,7 @@ def lite_bridge(path):
     cls.bases = [ast.Name(id='BaseTradeBridge', ctx=ast.Load())]
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in (
         '_dispatch', '_order_stock', '_order_stock_async', '_async_order_record',
-        '_register_pending_async_order', '_send_async_order_response',
+        '_register_pending_async_order', '_discard_pending_async_order', '_send_async_order_response',
         '_find_order_id', '_get_last_order_id', '_order_id_from_detail',
     )]
     namespace = dict(BaseTradeBridge=TxTradeBridge)
@@ -102,6 +102,8 @@ def connected(request, monkeypatch):
 
 
 def complete_async_order(env, order_id, order_remark="", stock_code="600000.SH"):
+    if not order_remark and len(env.bridge.pending_async_orders) == 1:
+        order_remark = env.bridge.pending_async_orders[0].get("order_remark", "")
     return env.bridge._handle_async_order_callback({
         "account_id": "TEST_ONLY",
         "stock_code": stock_code,
@@ -128,12 +130,11 @@ def test_async_prefixed_sysid_does_not_suppress_real_order_id(connected, batch, 
         notification["m_nRef"] = native_ref
     handler = env.client.handlers["trader:on_stock_order"]
     handler(notification)
-    if native_ref is None:
-        assert env.responses == []
-        assert seq not in env.trader._completed_async_order_seqs
-        assert any(item["seq"] == seq for item in env.trader._pending_async_orders)
-    else:
-        assert [response.order_id for response in env.responses] == [native_ref]
+    # Order-state callbacks never fabricate an ACK, even when their IDs look
+    # usable. The explicit seq-bearing response must close the request.
+    assert env.responses == []
+    assert seq not in env.trader._completed_async_order_seqs
+    assert any(item["seq"] == seq for item in env.trader._pending_async_orders)
     assert complete_async_order(env, 1082130604, order_remark=request["order_remark"])
     handler(notification)
     assert [(response.seq, response.order_id) for response in env.responses] == [(seq, 1082130604)]
@@ -154,6 +155,89 @@ def test_single_order_signatures_and_results_match_xttrader(connected):
     assert not hasattr(env.api, "register_callback")
     assert not hasattr(env.api, "query_stock_asset")
     assert not hasattr(env.api, "stop")
+
+
+def test_async_ack_requires_exact_reference_and_maps_out_of_order_callbacks(connected):
+    env = connected
+    first_seq = env.api.order_stock_async(env.account, **order(order_remark="client-ref-1"))
+    second_seq = env.api.order_stock_async(env.account, **order(order_remark="client-ref-2"))
+
+    # An old cancel/order update for this account and symbol is not an ACK.
+    assert not complete_async_order(env, 9100, order_remark="")
+    assert len(env.bridge.pending_async_orders) == 2
+    assert env.responses == []
+
+    # Even a seq-bearing response must carry the same per-order reference.
+    env.client.handlers["trader:on_order_stock_async_response"]({
+        "account_id": "TEST_ONLY", "seq": first_seq, "order_id": 9101,
+        "order_remark": "client-ref-2",
+    })
+    assert env.responses == []
+    assert any(item["seq"] == first_seq for item in env.trader._pending_async_orders)
+
+    # The second order may be acknowledged first; exact ref, not FIFO, chooses it.
+    assert complete_async_order(env, 9102, order_remark="client-ref-2")
+    assert [item.seq for item in env.responses] == [second_seq]
+    assert complete_async_order(env, 9103, order_remark="client-ref-1")
+    assert [item.seq for item in env.responses] == [second_seq, first_seq]
+    assert env.bridge.pending_async_orders == []
+
+
+def test_async_ack_survives_order_callback_during_qmt_submit(connected, monkeypatch):
+    env = connected
+
+    def submit_with_inline_callback(params, msg, **kwargs):
+        assert env.bridge.pending_async_orders
+        assert env.bridge._handle_async_order_callback({
+            "account_id": "TEST_ONLY",
+            "stock_code": params["stock_code"],
+            "order_remark": params["order_remark"],
+            "order_id": 9301,
+        })
+        return {
+            "request_result": 0,
+            "order_remark": params["order_remark"],
+            "account_type": "STOCK",
+            "previous_order_id": None,
+        }
+
+    monkeypatch.setattr(env.bridge, "_order_stock", submit_with_inline_callback)
+    seq = env.api.order_stock_async(
+        env.account,
+        **order(order_remark="inline-callback-ref"),
+    )
+
+    assert [(response.seq, response.order_id) for response in env.responses] == [(seq, 9301)]
+    assert env.bridge.pending_async_orders == []
+    assert not any(item["seq"] == seq for item in env.trader._pending_async_orders)
+
+
+def test_async_order_without_remark_gets_unique_reference(connected):
+    env = connected
+    first_seq = env.api.order_stock_async(env.account, **order(strategy_name="same-strategy"))
+    second_seq = env.api.order_stock_async(env.account, **order(strategy_name="same-strategy"))
+    first_ref, second_ref = [
+        request[1]["order_remark"]
+        for request in env.requests
+        if request[0] == "xttrader.order_stock_async"
+    ]
+
+    assert first_seq != second_seq
+    assert first_ref.startswith("CFQ") and second_ref.startswith("CFQ")
+    assert first_ref != second_ref
+    assert [item["order_remark"] for item in env.bridge.pending_async_orders] == [first_ref, second_ref]
+
+
+def test_order_state_callback_never_fabricates_an_async_ack(connected):
+    env = connected
+    seq = env.api.order_stock_async(env.account, **order(order_remark="state-update-test"))
+    env.client.handlers["trader:on_stock_order"]({
+        "account_id": "TEST_ONLY", "stock_code": "600000.SH", "order_id": 9201,
+        "order_remark": "state-update-test",
+    })
+
+    assert env.responses == []
+    assert any(item["seq"] == seq for item in env.trader._pending_async_orders)
 
 
 def test_single_cancel_async_returns_seq_and_deduplicates_callback(connected):
